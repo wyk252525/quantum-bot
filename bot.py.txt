@@ -1,0 +1,1931 @@
+import telebot
+from telebot import types
+import sqlite3
+import re
+import datetime
+import os
+import threading
+import logging
+import time
+import io
+import pandas as pd
+import json
+import concurrent.futures
+import secrets
+import string
+from datetime import timedelta
+import libtorrent as lt  # Torrent支持
+import zipfile
+import py7zr
+import magic
+from dotenv import load_dotenv
+import hashlib
+import shutil
+import psutil
+import re
+from collections import defaultdict
+
+# 加载环境变量
+load_dotenv()
+
+# 配置
+API_TOKEN = os.getenv('API_TOKEN', '7728956687:AAG7glfXZh6ZMWbGqr-6mxGK__BfxIFWxY8')
+ADMIN_ID = os.getenv('ADMIN_ID', '8027790214')  # 管理员ID
+LOG_CHANNEL = int(os.getenv('LOG_CHANNEL', -1007728956687))  # 日志频道
+CHANNEL_ID = int(os.getenv('CHANNEL_ID', -10012345678))  # 存储频道ID
+USE_LOCAL_STORAGE = os.getenv('USE_LOCAL_STORAGE', 'False').lower() == 'true'
+LOCAL_STORAGE_PATH = os.getenv('LOCAL_STORAGE_PATH', '/data/files')
+MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', 2000000000))  # 2GB
+ALLOWED_EXTENSIONS = os.getenv('ALLOWED_EXTENSIONS', 'txt,csv,xlsx,zip,7z,001,r\d+').split(',')
+
+bot = telebot.TeleBot(API_TOKEN)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# VIP特权配置
+VIP_PRIVILEGES = {
+    "daily_bonus": 30,  # 每日签到额外奖励
+    "query_discount": 0.7,  # 查询折扣率
+    "batch_limit": 5000,  # 批量查询行数限制
+    "custom_commands": True  # 是否允许自定义命令
+}
+
+# 分卷检测模式
+VOLUME_PATTERNS = [
+    r'\.part(\d+)\.', 
+    r'\.r(\d+)$',
+    r'\.z(\d+)$',
+    r'\.(\d{3})$'
+]
+
+volume_cache = defaultdict(list)
+
+# 数据库初始化
+def init_db():
+    conn = sqlite3.connect('soc_data.db', check_same_thread=False)
+    c = conn.cursor()
+    
+    # 用户表（增加vip字段）
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        credits INTEGER DEFAULT 0,
+        last_checkin DATE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        vip_expiry TIMESTAMP DEFAULT NULL,
+        total_redeemed INTEGER DEFAULT 0,
+        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP  -- 新增最后活跃时间字段
+    )''')
+    
+    # 查询日志表
+    c.execute('''CREATE TABLE IF NOT EXISTS query_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        command TEXT,
+        params TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        cost INTEGER
+    )''')
+    
+    # 数据上传记录
+    c.execute('''CREATE TABLE IF NOT EXISTS data_uploads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        file_name TEXT,
+        record_count INTEGER,
+        upload_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        status TEXT DEFAULT 'pending'
+    )''')
+    
+    # 命令消耗表
+    c.execute('''CREATE TABLE IF NOT EXISTS command_costs (
+        command TEXT PRIMARY KEY,
+        cost INTEGER
+    )''')
+    
+    # 批量查询任务表
+    c.execute('''CREATE TABLE IF NOT EXISTS batch_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        task_type TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        completed_at TIMESTAMP,
+        result_count INTEGER
+    )''')
+    
+    # 卡密系统表
+    c.execute('''CREATE TABLE IF NOT EXISTS recharge_cards (
+        card_id TEXT PRIMARY KEY,
+        amount INTEGER NOT NULL,
+        card_type TEXT CHECK(card_type IN ('credits', 'vip')),
+        vip_days INTEGER DEFAULT 0,
+        is_used BOOLEAN DEFAULT FALSE,
+        used_by INTEGER DEFAULT NULL,
+        used_at TIMESTAMP DEFAULT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_by INTEGER DEFAULT NULL,
+        expires_at TIMESTAMP,
+        note TEXT DEFAULT ''
+    )''')
+    
+    # 卡密使用记录表
+    c.execute('''CREATE TABLE IF NOT EXISTS card_usage_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        card_id TEXT,
+        user_id INTEGER,
+        redeemed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        amount INTEGER
+    )''')
+    
+    # 新增文件元数据表 (A文件功能)
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY,
+        file_id TEXT UNIQUE NOT NULL,
+        file_name TEXT NOT NULL,
+        data_type TEXT NOT NULL,
+        description TEXT,
+        tags TEXT,
+        auto_tags TEXT,
+        upload_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+        user_id INTEGER NOT NULL,
+        last_renewed DATETIME,
+        local_path TEXT,
+        channel_msg_id INTEGER,  -- B文件新增
+        torrent_path TEXT,       -- B文件新增
+        is_volume BOOLEAN DEFAULT 0,  -- B文件新增
+        volume_index INTEGER,    -- B文件新增
+        volume_total INTEGER    -- B文件新增
+    )''')
+    
+    # 全文检索索引 (A文件功能)
+    c.execute('''
+    CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING FTS5(
+        file_name, 
+        description, 
+        tags,
+        auto_tags
+    )''')
+    
+    # 数据类型配置表 (A文件功能)
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS data_types (
+        type_id TEXT PRIMARY KEY,
+        format TEXT NOT NULL,
+        example TEXT
+    )''')
+    
+    # 分卷组表 (B文件新增)
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS volume_groups (
+        group_id TEXT PRIMARY KEY,
+        user_id INTEGER,
+        file_name TEXT,
+        total_parts INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # 初始化命令消耗
+    commands = {
+        '/qd': 0,     # 签到免费
+        '/my': 1,     # QQ绑手机
+        '/qe': 3,     # 综合查询
+        '/yd': 1,     # 人口查询
+        '/bp': 5,     # V绑互查
+        '/ke': 8,    # 银行卡
+        '/ad': 1,     # IMEI查询
+        '/nk': 10,    # 上海10E
+        '/la': 5,    # 移动全库
+        '/fo': 1,     # 车主查询
+        '/kd': 2,     # 学习通
+        '/ne': 3,     # 滴滴数据
+        '/verify': 2, # 二要素核验
+        '/batch': 10, # 批量查询
+        '/redeem': 0,  # 卡密兑换
+        '/kn': 0,     # 个人中心免费
+        '/upload': 0,  # A文件新增
+        '/search': 0,  # A文件新增
+        '/renew': 0    # A文件新增
+    }
+    
+    for cmd, cost in commands.items():
+        c.execute('''INSERT OR IGNORE INTO command_costs (command, cost) 
+                     VALUES (?, ?)''', (cmd, cost))
+    
+    # 创建索引加速查询
+    c.execute("CREATE INDEX IF NOT EXISTS idx_users_credits ON users(credits)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_query_logs_user ON query_logs(user_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_query_logs_time ON query_logs(timestamp)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_cards_expiry ON recharge_cards(expires_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_files_volume ON files(is_volume)")  # B文件新增
+    
+    conn.commit()
+    return conn
+
+conn = init_db()
+
+# ==================== 积分管理函数 ====================
+def get_user_credits(user_id):
+    c = conn.cursor()
+    c.execute("SELECT credits FROM users WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    if result:
+        return result[0]
+    else:
+        # 新用户自动注册
+        c.execute("INSERT INTO users (user_id, credits) VALUES (?, ?)", (user_id, 0))
+        conn.commit()
+        return 0
+
+def update_credits(user_id, amount):
+    c = conn.cursor()
+    c.execute("UPDATE users SET credits = credits + ? WHERE user_id = ?", (amount, user_id))
+    conn.commit()
+
+# 更新用户最后活跃时间
+def update_user_last_active(user_id):
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("UPDATE users SET last_active = ? WHERE user_id = ?", (now, user_id))
+    conn.commit()
+
+def deduct_command_cost(user_id, command):
+    c = conn.cursor()
+    c.execute("SELECT cost FROM command_costs WHERE command = ?", (command,))
+    result = c.fetchone()
+    if not result:
+        return False, 0
+    cost = result[0]
+    
+    # VIP用户折扣
+    if is_vip_user(user_id):
+        cost = int(cost * VIP_PRIVILEGES["query_discount"])
+    
+    current_credits = get_user_credits(user_id)
+    if current_credits < cost:
+        return False, cost
+    
+    update_credits(user_id, -cost)
+    return True, cost
+
+# VIP状态检查
+def is_vip_user(user_id):
+    c = conn.cursor()
+    c.execute("SELECT vip_expiry FROM users WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    if result and result[0]:
+        expiry = datetime.datetime.fromisoformat(result[0])
+        return expiry > datetime.datetime.now()
+    return False
+
+# ==================== 分卷上传核心功能 (B文件) ====================
+def is_volume_file(filename):
+    return any(re.search(p, filename) for p in VOLUME_PATTERNS)
+
+def get_volume_info(filename):
+    for pattern in VOLUME_PATTERNS:
+        match = re.search(pattern, filename)
+        if match:
+            return {
+                'base_name': re.sub(pattern, '', filename),
+                'index': int(match.group(1)),
+                'total': None  # 需要后续检测
+            }
+    return None
+
+def detect_total_parts(group_id):
+    # 简单实现：假设分卷总数是最大序号
+    parts = [vol['index'] for vol in volume_cache[group_id]]
+    return max(parts) if parts else 0
+
+def save_to_channel(file_data, file_name):
+    try:
+        # 转发到私有频道
+        msg = bot.send_document(CHANNEL_ID, file_data, visible_file_name=file_name)
+        return msg.message_id
+    except Exception as e:
+        logging.error(f"频道存储失败: {str(e)}")
+        return None
+
+def create_torrent(file_path):
+    try:
+        fs = lt.file_storage()
+        lt.add_files(fs, file_path)
+        torrent = lt.create_torrent(fs)
+        lt.set_piece_hashes(torrent, os.path.dirname(file_path))
+        torrent_path = f"{file_path}.torrent"
+        with open(torrent_path, "wb") as f:
+            f.write(lt.bencode(torrent.generate()))
+        return torrent_path
+    except Exception as e:
+        logging.error(f"创建种子失败: {str(e)}")
+        return None
+
+def process_volume_upload(message):
+    try:
+        user_id = message.from_user.id
+        file_name = message.document.file_name
+        volume_info = get_volume_info(file_name)
+        
+        if not volume_info:
+            bot.reply_to(message, "❌ 无法识别分卷格式")
+            return
+            
+        # 创建分卷组
+        group_id = f"{user_id}_{volume_info['base_name']}"
+        if group_id not in volume_cache:
+            volume_cache[group_id] = []
+            c = conn.cursor()
+            c.execute("INSERT INTO volume_groups (group_id, user_id, file_name) VALUES (?, ?, ?)", 
+                        (group_id, user_id, volume_info['base_name']))
+            conn.commit()
+        
+        # 保存分卷
+        volume_cache[group_id].append({
+            'index': volume_info['index'],
+            'file_id': message.document.file_id,
+            'file_name': file_name
+        })
+        
+        # 检查是否完成
+        total_parts = detect_total_parts(group_id)
+        if len(volume_cache[group_id]) == total_parts:
+            threading.Thread(target=merge_and_process, args=(group_id, user_id)).start()
+            bot.reply_to(message, f"✅ 所有分卷已接收！开始处理合并...")
+        else:
+            bot.reply_to(message, f"⏳ 已接收分卷 {len(volume_cache[group_id])}/{total_parts}，请继续上传")
+            
+    except Exception as e:
+        bot.reply_to(message, f"❌ 分卷处理错误: {str(e)}")
+
+def merge_and_process(group_id, user_id):
+    try:
+        # 获取组信息
+        group_data = volume_cache[group_id]
+        base_name = group_data[0]['base_name']
+        
+        # 按序号排序
+        sorted_volumes = sorted(group_data, key=lambda x: x['index'])
+        
+        # 创建临时目录
+        temp_dir = f"temp_{group_id}"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # 下载所有分卷
+        for vol in sorted_volumes:
+            file_info = bot.get_file(vol['file_id'])
+            content = bot.download_file(file_info.file_path)
+            part_path = os.path.join(temp_dir, vol['file_name'])
+            with open(part_path, 'wb') as f:
+                f.write(content)
+        
+        # 合并文件
+        merged_path = os.path.join(temp_dir, base_name)
+        with open(merged_path, 'wb') as outfile:
+            for vol in sorted_volumes:
+                part_path = os.path.join(temp_dir, vol['file_name'])
+                with open(part_path, 'rb') as infile:
+                    outfile.write(infile.read())
+        
+        # 处理合并后文件
+        process_large_file(user_id, merged_path, base_name)
+        
+        # 清理缓存
+        del volume_cache[group_id]
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        bot.send_message(user_id, f"✅ {base_name} 合并处理完成！")
+        
+    except Exception as e:
+        logging.error(f"分组合并失败: {str(e)}")
+        bot.send_message(user_id, f"❌ 合并失败: {str(e)}")
+
+def process_large_file(user_id, file_path, original_name):
+    try:
+        # 频道存储
+        with open(file_path, 'rb') as f:
+            channel_msg_id = save_to_channel(f, original_name)
+        
+        if not channel_msg_id:
+            raise Exception("频道存储失败")
+        
+        # 生成种子
+        torrent_path = create_torrent(file_path)
+        
+        if not torrent_path:
+            raise Exception("种子创建失败")
+        
+        # 保存到数据库
+        c = conn.cursor()
+        c.execute('''
+        INSERT INTO files (file_name, user_id, channel_msg_id, torrent_path, is_volume, volume_total)
+        VALUES (?, ?, ?, ?, 1, ?)
+        ''', (original_name, user_id, channel_msg_id, torrent_path, len(volume_cache.get(f"{user_id}_{original_name}", [])))
+        file_id = c.lastrowid
+        conn.commit()
+        
+        # 建立全文索引
+        create_search_index(file_id)
+        
+        # 返回结果
+        channel_link = f"https://t.me/c/{str(CHANNEL_ID).replace('-100', '')}/{channel_msg_id}"
+        
+        # 发送种子文件
+        with open(torrent_path, 'rb') as torrent_file:
+            bot.send_document(
+                user_id, 
+                torrent_file,
+                caption=(
+                    f"📦 文件存储完成！\n"
+                    f"文件名: {original_name}\n"
+                    f"🔗 频道下载: {channel_link}\n"
+                    f"🧲 种子文件已附加"
+                ),
+                visible_file_name=f"{original_name}.torrent"
+            )
+        
+        # 本地存储后备
+        if USE_LOCAL_STORAGE:
+            save_file_locally(file_id)
+        
+    except Exception as e:
+        bot.send_message(user_id, f"❌ 大文件处理失败: {str(e)}")
+        logging.error(f"大文件处理错误: {str(e)}")
+
+# ==================== 文件管理功能 (A文件) ====================
+# 数据类型配置
+DATA_TYPES = {
+    "qq": {"format": "QQ号,手机号,姓名", "example": "123456,13800138000,张三"},
+    "id": {"format": "姓名,身份证号", "example": "李四,110101199001011234"},
+    "bank": {"format": "姓名,银行卡号,开户行", "example": "王五,6222021234567890,工商银行"},
+    "vehicle": {"format": "车牌号,车架号,车主姓名", "example": "京A12345,LFV2A21KX43000000,赵六"},
+    "other": {"format": "自由格式", "example": "任意结构数据"}
+}
+
+def save_metadata(metadata):
+    c = conn.cursor()
+    c.execute('''
+    INSERT INTO files (file_id, file_name, data_type, user_id, upload_time)
+    VALUES (?, ?, ?, ?, ?)
+    ''', (
+        metadata['file_id'],
+        metadata['file_name'],
+        metadata['data_type'],
+        metadata['user_id'],
+        metadata['upload_time']
+    ))
+    conn.commit()
+    return c.lastrowid
+
+def create_search_index(file_id):
+    c = conn.cursor()
+    c.execute('''
+    SELECT file_name, description, tags, auto_tags 
+    FROM files 
+    WHERE id = ?
+    ''', [file_id])
+    file_data = c.fetchone()
+    
+    if file_data:
+        c.execute('''
+        INSERT INTO search_index (rowid, file_name, description, tags, auto_tags)
+        VALUES (?, ?, ?, ?, ?)
+        ''', (file_id, file_data[0], file_data[1], file_data[2], file_data[3]))
+        conn.commit()
+
+def get_file_metadata(file_id):
+    c = conn.cursor()
+    c.execute('SELECT * FROM files WHERE id = ?', [file_id])
+    columns = [col[0] for col in c.description]
+    data = c.fetchone()
+    return dict(zip(columns, data)) if data else None
+
+def get_fresh_link(file_id):
+    try:
+        file_data = get_file_metadata(file_id)
+        if not file_data:
+            return "❌ 文件不存在"
+        
+        # 如果是分卷文件，直接返回频道链接
+        if file_data['is_volume'] and file_data['channel_msg_id']:
+            return f"https://t.me/c/{str(CHANNEL_ID).replace('-100', '')}/{file_data['channel_msg_id']}"
+        
+        file_info = bot.get_file(file_data['file_id'])
+        fresh_url = f"https://api.telegram.org/file/bot{API_TOKEN}/{file_info.file_path}"
+        
+        # 更新最后续期时间
+        c = conn.cursor()
+        c.execute('''
+        UPDATE files 
+        SET last_renewed = ? 
+        WHERE id = ?
+        ''', (datetime.datetime.now().isoformat(), file_id))
+        conn.commit()
+        
+        return fresh_url
+    except Exception as e:
+        logging.error(f"获取文件链接失败: {str(e)}")
+        if USE_LOCAL_STORAGE:
+            return get_local_file(file_id)
+        return "❌ 文件链接获取失败"
+
+# 本地后备存储系统
+def save_file_locally(file_id):
+    """将文件保存到本地后备存储"""
+    try:
+        # 获取文件元数据
+        file_data = get_file_metadata(file_id)
+        if not file_data:
+            logging.error(f"本地存储失败: 文件ID {file_id} 不存在")
+            return
+        
+        # 从TG下载文件
+        file_info = bot.get_file(file_data['file_id'])
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        # 创建存储目录
+        os.makedirs(LOCAL_STORAGE_PATH, exist_ok=True)
+        
+        # 保存文件
+        file_path = os.path.join(LOCAL_STORAGE_PATH, f"{file_data['file_id']}_{file_data['file_name']}")
+        with open(file_path, 'wb') as f:
+            f.write(downloaded_file)
+        
+        # 记录本地存储路径
+        c = conn.cursor()
+        c.execute('''
+        UPDATE files 
+        SET local_path = ? 
+        WHERE id = ?
+        ''', (file_path, file_id))
+        conn.commit()
+        
+        logging.info(f"文件保存到本地: {file_path}")
+    except Exception as e:
+        logging.error(f"本地存储失败: {str(e)}")
+
+def get_local_file(file_id):
+    """从本地存储获取文件"""
+    c = conn.cursor()
+    c.execute('SELECT local_path FROM files WHERE id = ?', [file_id])
+    result = c.fetchone()
+    
+    if result and result[0] and os.path.exists(result[0]):
+        return result[0]
+    return "❌ 本地文件不存在"
+
+def generate_auto_tags(file_name):
+    """从文件名生成自动标签"""
+    tags = []
+    
+    # 识别常见关键词
+    keywords = {
+        'QQ': ['qq', '企鹅'],
+        'ID': ['身份证', 'id', '证件'],
+        'Bank': ['银行', '银行卡', '账户'],
+        'Phone': ['手机', '电话', '号码'],
+        'Vehicle': ['车牌', '车辆', '车主']
+    }
+    
+    for tag, patterns in keywords.items():
+        for pattern in patterns:
+            if pattern.lower() in file_name.lower():
+                tags.append(tag)
+                break
+    
+    # 识别日期
+    date_match = re.search(r'(\d{4})[-_]?(\d{2})[-_]?(\d{2})', file_name)
+    if date_match:
+        tags.append(f"日期:{date_match.group()}")
+    
+    # 识别地区
+    regions = ['北京', '上海', '广州', '深圳', '江苏', '浙江', '广东']
+    for region in regions:
+        if region in file_name:
+            tags.append(f"地区:{region}")
+    
+    return ','.join(set(tags)) if tags else "未分类"
+
+# ==================== 文件上传命令 ====================
+@bot.message_handler(commands=['upload'])
+def handle_upload(message):
+    user_id = message.from_user.id
+    
+    # 验证管理员权限
+    if str(user_id) != ADMIN_ID:
+        bot.reply_to(message, "❌ 仅管理员可上传文件")
+        return
+    
+    # 解析上传命令
+    args = message.text.split()
+    if len(args) < 2:
+        return show_upload_help(message)
+    
+    data_type = args[1].lower()
+    if data_type not in DATA_TYPES:
+        bot.reply_to(message, f"❌ 无效数据类型，可用: {', '.join(DATA_TYPES.keys())}")
+        return
+    
+    # 保存上传类型到上下文
+    bot.reply_to(
+        message,
+        f"🔼 请发送 {data_type} 数据文件 (支持: TXT, CSV, XLSX, ZIP, 7Z)\n"
+        f"格式要求: {DATA_TYPES[data_type]['format']}"
+    )
+    bot.register_next_step_handler(message, process_file_upload, data_type)
+
+def show_upload_help(message):
+    help_text = (
+        "📤 文件上传使用说明:\n\n"
+        "命令格式: `/upload 数据类型`\n"
+        "可用数据类型:\n"
+    )
+    for dtype, info in DATA_TYPES.items():
+        help_text += f"- {dtype}: {info['format']} (示例: {info['example']})\n"
+    
+    bot.reply_to(message, help_text, parse_mode='Markdown')
+
+def process_file_upload(message, data_type):
+    user_id = message.from_user.id
+    if not message.document:
+        bot.reply_to(message, "❌ 请发送文件附件")
+        return
+    
+    file_info = bot.get_file(message.document.file_id)
+    file_name = message.document.file_name
+    file_ext = file_name.split('.')[-1].lower() if '.' in file_name else ''
+    
+    # 验证文件类型
+    if file_ext not in ALLOWED_EXTENSIONS:
+        bot.reply_to(message, f"❌ 不支持的文件格式: {file_ext}")
+        return
+    
+    # 检查文件大小 - 管理员无限制
+    # if file_info.file_size > MAX_FILE_SIZE:
+    #     bot.reply_to(message, f"❌ 文件过大 ({file_info.file_size/1024/1024:.2f}MB > {MAX_FILE_SIZE/1024/1024}MB)")
+    #     return
+    
+    # 提取元数据
+    metadata = {
+        'file_id': file_info.file_id,
+        'file_name': file_name,
+        'data_type': data_type,
+        'user_id': user_id,
+        'upload_time': datetime.datetime.now().isoformat()
+    }
+    
+    # 存储元数据
+    file_id = save_metadata(metadata)
+    
+    # 请求补充描述
+    bot.reply_to(
+        message,
+        "📝 请添加文件描述和标签 (用逗号分隔):\n"
+        "示例: 客户数据2023, 手机号, 身份证号"
+    )
+    bot.register_next_step_handler(message, process_file_description, file_id)
+
+def process_file_description(message, file_id):
+    text = message.text
+    
+    # 解析描述和标签
+    if ',' in text:
+        description, tags = text.split(',', 1)
+    else:
+        description, tags = text, ""
+    
+    # 更新数据库
+    c = conn.cursor()
+    c.execute('''
+    UPDATE files 
+    SET description = ?, tags = ?, auto_tags = ?
+    WHERE id = ?
+    ''', (
+        description.strip(),
+        tags.strip(),
+        generate_auto_tags(message.document.file_name),
+        file_id
+    ))
+    conn.commit()
+    
+    # 建立全文索引
+    create_search_index(file_id)
+    
+    # 本地存储后备
+    if USE_LOCAL_STORAGE:
+        save_file_locally(file_id)
+    
+    bot.reply_to(message, "✅ 文件已成功索引!")
+
+# ==================== 文件检索命令 ====================
+@bot.message_handler(commands=['search'])
+def handle_search(message):
+    query = ' '.join(message.text.split()[1:])
+    if not query:
+        bot.reply_to(message, "🔍 请输入搜索关键词")
+        return
+    
+    # 执行全文检索
+    c = conn.cursor()
+    c.execute('''
+    SELECT rowid, file_name, description, is_volume, channel_msg_id 
+    FROM search_index 
+    JOIN files ON search_index.rowid = files.id
+    WHERE search_index MATCH ?
+    ORDER BY rank
+    LIMIT 10
+    ''', [query])
+    results = c.fetchall()
+    
+    if not results:
+        bot.reply_to(message, "❌ 未找到匹配文件")
+        return
+    
+    # 格式化结果
+    response = "🔍 搜索结果:\n\n"
+    for idx, row in enumerate(results):
+        file_id, file_name, description, is_volume, channel_msg_id = row
+        fresh_url = get_fresh_link(file_id)
+        
+        if is_volume:
+            response += f"{idx+1}. 📦 [分卷文件] {file_name}\n"
+            response += f"   - {description}\n"
+            if channel_msg_id:
+                channel_link = f"https://t.me/c/{str(CHANNEL_ID).replace('-100', '')}/{channel_msg_id}"
+                response += f"   🔗 频道下载: {channel_link}\n"
+            response += f"   🧲 种子获取: /get_torrent_{file_id}\n\n"
+        else:
+            response += f"{idx+1}. {file_name}\n"
+            response += f"   - {description}\n"
+            response += f"   🔗 下载链接: {fresh_url}\n\n"
+    
+    bot.reply_to(message, response)
+
+# 种子获取命令 (B文件新增)
+@bot.message_handler(regexp=r'/get_torrent_(\d+)')
+def send_torrent(message):
+    try:
+        file_id = re.search(r'/get_torrent_(\d+)', message.text).group(1)
+        c = conn.cursor()
+        c.execute("SELECT torrent_path, file_name FROM files WHERE id = ?", (file_id,))
+        result = c.fetchone()
+        
+        if result and result[0] and os.path.exists(result[0]):
+            with open(result[0], 'rb') as f:
+                bot.send_document(
+                    message.chat.id, 
+                    f,
+                    visible_file_name=f"{result[1]}.torrent"
+                )
+        else:
+            bot.reply_to(message, "❌ 种子文件不存在或已过期")
+    except Exception as e:
+        bot.reply_to(message, f"❌ 获取种子失败: {str(e)}")
+
+# ==================== 主机器人功能 ====================
+# 智能引导键盘 - 添加个人中心按钮
+def create_main_keyboard():
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    buttons = [
+        "📅 签到 /qd", "🔍 综合查询 /qe",
+        "👤 人口查询 /yd", "📱 QQ绑手机 /my",
+        "💳 银行卡 /ke", "🚗 车主查询 /fo",
+        "📊 我的积分 /credits", "👤 个人中心 /kn",  # 新增个人中心按钮
+        "🔄 批量查询 /batch", "✅ 二要素核验 /verify",
+        "🎫 卡密兑换 /redeem", "🔍 文件搜索 /search"  # 新增文件搜索
+    ]
+    markup.add(*buttons)
+    return markup
+
+def create_admin_keyboard():
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    buttons = [
+        "📊 系统状态 /stats",
+        "📤 数据更新 /update_data",
+        "🔄 重置积分 /reset_credits",
+        "📝 发送公告 /announce",
+        "📋 批量任务 /batch_tasks",
+        "🔑 卡密管理 /cardadmin",
+        "📁 文件上传 /upload"  # 管理员新增文件上传
+    ]
+    markup.add(*buttons)
+    return markup
+
+# 文件上传处理 (支持批量查询和数据更新)
+@bot.message_handler(content_types=['document'])
+def handle_document(message):
+    user_id = message.from_user.id
+    file_info = bot.get_file(message.document.file_id)
+    file_name = message.document.file_name
+    
+    # 更新用户最后活跃时间
+    update_user_last_active(user_id)
+    
+    # 检查文件类型
+    if not any(file_name.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS):
+        bot.reply_to(message, "❌ 不支持的文件格式")
+        return
+    
+    # 判断是否为分卷文件 (B文件)
+    if is_volume_file(file_name):
+        process_volume_upload(message)
+        return
+    
+    # 检查文件大小 - 管理员无限制
+    # if file_info.file_size > MAX_FILE_SIZE:
+    #     bot.reply_to(message, f"❌ 文件超过5MB限制")
+    #     return
+    
+    try:
+        # 下载文件内容
+        downloaded_file = bot.download_file(file_info.file_path)
+        file_content = io.BytesIO(downloaded_file)
+        
+        # 判断上传类型 (批量查询或数据更新)
+        if message.caption and '/batch' in message.caption:
+            # 批量查询任务
+            max_lines = VIP_PRIVILEGES["batch_limit"] if is_vip_user(user_id) else 1000
+            line_count = len(downloaded_file.splitlines())
+            
+            if line_count > max_lines:
+                bot.reply_to(
+                    message,
+                    f"❌ 文件行数超过限制 ({line_count} > {max_lines})\n"
+                    f"普通用户最多1000行，VIP用户可处理{max_lines}行"
+                )
+                return
+            
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO batch_tasks (user_id, task_type, status) VALUES (?, ?, ?)",
+                (user_id, 'query', 'pending')
+            )
+            task_id = c.lastrowid
+            conn.commit()
+            
+            # 启动后台处理
+            threading.Thread(target=process_batch_query, args=(task_id, downloaded_file)).start()
+            
+            bot.reply_to(
+                message,
+                f"✅ 批量查询任务已接收!\n"
+                f"任务ID: `{task_id}`\n"
+                f"文件名: {file_name}\n"
+                f"系统正在后台处理，处理完成后会通知您\n"
+                f"预计处理时间: {line_count//50}分钟",
+                parse_mode='Markdown'
+            )
+            
+        elif str(user_id) == ADMIN_ID:
+            # 数据更新任务
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO data_uploads (user_id, file_name) VALUES (?, ?)",
+                (user_id, file_name)
+            )
+            upload_id = c.lastrowid
+            conn.commit()
+            
+            # 启动后台处理
+            threading.Thread(target=process_uploaded_data, args=(upload_id, downloaded_file)).start()
+            
+            bot.reply_to(
+                message,
+                f"✅ 数据文件接收成功!\n"
+                f"文件名: {file_name}\n"
+                f"系统正在后台处理，请稍后使用 /status {upload_id} 查看进度"
+            )
+        else:
+            bot.reply_to(message, "❌ 仅管理员可上传数据文件")
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ 文件处理失败: {str(e)}")
+
+# ==================== 命令处理 - 核心功能 ====================
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    
+    # 更新用户活跃时间
+    update_user_last_active(user_id)
+    
+    # 检查用户权限
+    keyboard = create_main_keyboard()
+    if str(user_id) == ADMIN_ID:
+        keyboard = create_admin_keyboard()
+    
+    # 检查VIP状态
+    vip_status = ""
+    if is_vip_user(user_id):
+        c = conn.cursor()
+        c.execute("SELECT vip_expiry FROM users WHERE user_id = ?", (user_id,))
+        expiry_result = c.fetchone()
+        if expiry_result and expiry_result[0]:
+            expiry = expiry_result[0].split('.')[0]  # 正确处理时间格式
+            vip_status = f"\n🌟 *您是尊贵的VIP会员* (有效期至 {expiry})"
+    
+    welcome_msg = (
+        f"👋 欢迎 *{username}* 使用老皮社工库机器人！{vip_status}\n\n"
+        "🔐 *使用指南*\n"
+        "1. 每日签到获取积分 💰\n"
+        "2. 使用命令查询数据 🔍\n"
+        "3. 查询会消耗相应积分\n\n"
+        "✨ *新增功能*\n"
+        "• /verify - 二要素核验(姓名+身份证)\n"
+        "• /batch - 批量查询(上传CSV文件)\n"
+        "• /redeem - 卡密兑换积分或VIP\n"
+        "• /kn - 个人中心\n"
+        "• /search - 文件检索系统\n\n"
+        "📋 *可用命令*\n"
+        "• /qd - 每日签到\n"
+        "• /my [QQ号] [手机号] - QQ绑手机查询\n"
+        "• /qe [信息] - 综合查询\n"
+        "• /yd [姓名] [城市] - 人口查询\n"
+        "• /bp [wxid] [手机号] - V信绑定查询\n"
+        "• /ke [身份证] [银行卡号] - 银行卡查询\n"
+        "• /ad [IMEI码] - 手机设备查询\n"
+        "• /nk [姓名] [手机] [身份证] - 上海10E查询\n"
+        "• /la [手机] [身份证] - 移动全库查询\n"
+        "• /fo [车牌/车架号] - 车主查询\n"
+        "• /kd [账号] [姓名] [手机] - 学习通查询\n"
+        "• /ne [手机] [身份证] - 滴滴数据查询\n"
+        "• /verify [姓名] [身份证号] - 二要素核验\n"
+        "• /batch - 批量查询(上传CSV)\n"
+        "• /redeem [卡号] - 兑换卡密\n"
+        "• /kn - 个人中心\n"
+        "• /search [关键词] - 文件检索\n\n"
+        "🎁 *卡密购买通道*  \n"
+        "[点击进入卡网](您的店铺链接)  \n"
+        "🔥 当前可购：  \n"
+        "- 1000积分卡 ¥10  \n"
+        "- 月VIP卡 ¥50 (享查询7折+批量特权)  \n"
+        "⚠️ 兑换命令：/redeem 卡号  \n\n"
+        "👉 点击下方按钮开始使用！"
+    )
+    
+    bot.send_message(
+        message.chat.id,
+        welcome_msg,
+        parse_mode='Markdown',
+        reply_markup=keyboard
+    )
+    
+    # 记录新用户
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", 
+              (user_id, username))
+    conn.commit()
+
+# ==================== 其他核心功能 ====================
+# 个人中心命令
+@bot.message_handler(commands=['kn'])
+def user_profile(message):
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    
+    # 更新用户最后活跃时间
+    update_user_last_active(user_id)
+    
+    # 获取用户数据
+    c = conn.cursor()
+    c.execute("SELECT credits, vip_expiry, last_active, total_redeemed FROM users WHERE user_id = ?", (user_id,))
+    user_data = c.fetchone()
+    
+    if not user_data:
+        bot.reply_to(message, "❌ 用户数据不存在")
+        return
+    
+    credits, vip_expiry, last_active, total_redeemed = user_data
+    
+    # 格式化VIP状态
+    vip_status = "普通用户"
+    if vip_expiry and datetime.datetime.fromisoformat(vip_expiry) > datetime.datetime.now():
+        expiry = vip_expiry.split('.')[0]  # 正确处理时间格式
+        vip_status = f"🌟 VIP会员 (有效期至 {expiry})"
+    
+    # 格式化最后活跃时间
+    last_active_str = last_active.split('.')[0] if last_active else "未知"
+    
+    # 创建个人中心面板
+    profile_msg = (
+        f"👤 *个人中心* - @{username}\n\n"
+        f"🆔 用户ID: `{user_id}`\n"
+        f"💰 当前积分: *{credits}*\n"
+        f"🎫 账户状态: {vip_status}\n"
+        f"⏱ 最后活跃: {last_active_str}\n"
+        f"🎁 累计充值: {total_redeemed}积分\n\n"
+        "📊 *账户统计*\n"
+        "• 今日查询: 5次\n"
+        "• 本月查询: 32次\n"
+        "• 累计查询: 128次\n\n"
+        "💎 VIP特权: 查询7折 | 批量处理 | 每日双倍积分"
+    )
+    
+    # 添加操作按钮
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
+        types.InlineKeyboardButton("充值积分", callback_data="recharge_credits"),
+        types.InlineKeyboardButton("续费VIP", callback_data="renew_vip")
+    )
+    markup.row(
+        types.InlineKeyboardButton("邀请好友", callback_data="invite_friends"),
+        types.InlineKeyboardButton("使用记录", callback_data="usage_history")
+    )
+    
+    bot.send_message(
+        message.chat.id,
+        profile_msg,
+        parse_mode='Markdown',
+        reply_markup=markup
+    )
+
+@bot.message_handler(commands=['qd'])
+def check_in(message):
+    user_id = message.from_user.id
+    today = datetime.date.today().isoformat()
+    
+    # 更新用户活跃时间
+    update_user_last_active(user_id)
+    
+    c = conn.cursor()
+    c.execute("SELECT last_checkin FROM users WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    
+    if result and result[0] == today:
+        bot.reply_to(message, "⏰ 您今天已经签到过了，请明天再来！")
+        return
+    
+    # 计算签到奖励
+    bonus = 15
+    if is_vip_user(user_id):
+        bonus += VIP_PRIVILEGES["daily_bonus"]
+    
+    # 更新签到状态和积分
+    c.execute("UPDATE users SET last_checkin = ?, credits = credits + ? WHERE user_id = ?", 
+              (today, bonus, user_id))
+    conn.commit()
+    
+    # 获取最新积分
+    credits = get_user_credits(user_id)
+    
+    reply_msg = f"✅ 签到成功！获得 {bonus} 积分\n💰 当前总积分: {credits}"
+    if is_vip_user(user_id):
+        reply_msg += "\n🎉 VIP用户额外奖励!"
+    
+    bot.reply_to(
+        message,
+        reply_msg,
+        reply_markup=create_main_keyboard()
+    )
+
+# ==================== 查询缓存优化 ====================
+query_cache = {}
+CACHE_EXPIRY = 300  # 5分钟缓存
+
+def get_cached_query(key):
+    now = time.time()
+    if key in query_cache:
+        cached_time, result = query_cache[key]
+        if now - cached_time < CACHE_EXPIRY:
+            return result
+    return None
+
+def set_cached_query(key, result):
+    query_cache[key] = (time.time(), result)
+
+# ==================== 智能命令处理 ====================
+def handle_query_command(command, params_pattern):
+    def decorator(func):
+        @bot.message_handler(commands=[command[1:]])
+        def wrapper(message):
+            user_id = message.from_user.id
+            username = message.from_user.username or str(user_id)
+            
+            # 更新用户活跃时间
+            update_user_last_active(user_id)
+            
+            # 检查积分
+            success, cost = deduct_command_cost(user_id, command)
+            if not success:
+                bot.reply_to(
+                    message,
+                    f"❌ 积分不足！需要 {cost} 积分，您当前有 {get_user_credits(user_id)} 积分\n"
+                    "请签到或联系管理员充值"
+                )
+                return
+            
+            # 解析参数
+            try:
+                parts = message.text.split()
+                if len(parts) < 2:
+                    raise ValueError("缺少参数")
+                
+                # 提取参数
+                params = parts[1:]
+                if not re.match(params_pattern, " ".join(params)):
+                    raise ValueError("参数格式错误")
+                
+                # 检查缓存
+                cache_key = f"{command}:{':'.join(params)}"
+                cached_result = get_cached_query(cache_key)
+                if cached_result:
+                    bot.reply_to(message, cached_result)
+                    return
+                
+                # 记录查询
+                c = conn.cursor()
+                c.execute(
+                    "INSERT INTO query_logs (user_id, command, params, cost) VALUES (?, ?, ?, ?)",
+                    (user_id, command, " ".join(params), cost)
+                )
+                conn.commit()
+                
+                # 执行查询
+                result = func(params)
+                
+                # 设置缓存
+                set_cached_query(cache_key, result)
+                
+                # 发送结果
+                bot.reply_to(message, result)
+                
+                # 日志记录
+                log_msg = (
+                    f"🔍 查询记录\n"
+                    f"用户: @{username}\n"
+                    f"命令: {command}\n"
+                    f"参数: {' '.join(params)}\n"
+                    f"消耗: {cost}积分"
+                )
+                bot.send_message(LOG_CHANNEL, log_msg)
+                
+            except Exception as e:
+                conn.rollback()
+                update_credits(user_id, cost)  # 返还积分
+                bot.reply_to(
+                    message,
+                    f"⚠️ 错误: {str(e)}\n"
+                    f"正确格式: `{command} {params_pattern}`\n"
+                    "示例: `{command} {' '.join(params_pattern.split()[:2])}...`",
+                    parse_mode='Markdown'
+                )
+        return wrapper
+    return decorator
+
+# ==================== 查询命令实现 ====================
+# 二要素核验功能
+@handle_query_command('/verify', r'\S+ \d{17}[\dX]')
+def id_verification(params):
+    name, id_card = params
+    # 这里调用第三方API进行核验
+    # 模拟API响应
+    verification_result = {
+        "status": "success",
+        "result": "一致",
+        "province": "北京",
+        "birthday": "1990-01-01",
+        "gender": "男"
+    }
+    
+    # 掩码处理身份证号
+    masked_id = id_card[:6] + '*' * 8 + id_card[-4:]
+    
+    return (
+        f"🆔 二要素核验结果\n\n"
+        f"姓名: *{name}*\n"
+        f"身份证: `{masked_id}`\n"
+        f"核验结果: ✅ {verification_result['result']}\n"
+        f"性别: {verification_result['gender']}\n"
+        f"出生日期: {verification_result['birthday']}\n"
+        f"省份: {verification_result['province']}"
+    )
+
+# 查询命令实现
+@handle_query_command('/my', r'\d{5,12} 1\d{10}')
+def qq_bind_query(params):
+    qq, phone = params
+    # 掩码处理手机号
+    masked_phone = phone[:3] + '****' + phone[-4:]
+    
+    return (
+        f"🔍 QQ绑定查询结果\n\n"
+        f"📱 QQ号码: {qq}\n"
+        f"📞 手机号: {masked_phone}\n"
+        f"🔗 绑定状态: 已绑定\n"
+        f"⏱ 绑定时间: 2023-08-15\n"
+        f"🌍 归属地: 广东深圳"
+    )
+
+@handle_query_command('/yd', r'\S+ \S+')
+def population_query(params):
+    name, city = params
+    return (
+        f"👤 人口查询结果\n\n"
+        f"姓名: {name}\n"
+        f"城市: {city}\n"
+        f"年龄: 32\n"
+        f"性别: 男\n"
+        f"身份证: 310***199105******\n"
+        f"户籍地址: {city}市朝阳区"
+    )
+
+@handle_query_command('/nk', r'\S+ 1\d{10} \d{17}[\dX]')
+def shanghai_query(params):
+    name, phone, id_card = params
+    # 掩码处理敏感信息
+    masked_phone = phone[:3] + '****' + phone[-4:]
+    masked_id = id_card[:6] + '*' * 8 + id_card[-4:]
+    
+    return (
+        f"🏙 上海10E查询结果\n\n"
+        f"姓名: {name}\n"
+        f"手机: {masked_phone}\n"
+        f"身份证: {masked_id}\n"
+        f"社保状态: 正常缴纳\n"
+        f"公积金账户: 3100****\n"
+        f"最近活动: 2024-01-15 浦东新区"
+    )
+
+# ==================== 积分查询 ====================
+@bot.message_handler(commands=['credits'])
+def show_credits(message):
+    user_id = message.from_user.id
+    credits = get_user_credits(user_id)
+    
+    # 更新用户活跃时间
+    update_user_last_active(user_id)
+    
+    # 获取VIP状态
+    vip_status = "普通用户"
+    if is_vip_user(user_id):
+        c = conn.cursor()
+        c.execute("SELECT vip_expiry FROM users WHERE user_id = ?", (user_id,))
+        expiry_result = c.fetchone()
+        if expiry_result and expiry_result[0]:
+            expiry = expiry_result[0].split('.')[0]  # 正确处理时间格式
+            vip_status = f"🌟 VIP会员 (有效期至 {expiry})"
+    
+    bot.reply_to(
+        message,
+        f"💰 您的当前积分: *{credits}*\n"
+        f"👤 账户状态: {vip_status}\n\n"
+        "📝 积分获取方式:\n"
+        "• 每日签到: +15分 (VIP +30分)\n"
+        "• 邀请新用户: +30分/人\n"
+        "• 数据贡献: +70分/批\n"
+        "• 卡密兑换: /redeem 命令\n\n"
+        "🔄 积分每日0点刷新",
+        parse_mode='Markdown'
+    )
+
+# ==================== 卡密兑换功能 ====================
+@bot.message_handler(commands=['redeem'])
+def redeem_card_command(message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    
+    # 更新用户活跃时间
+    update_user_last_active(user_id)
+    
+    if len(text.split()) < 2:
+        bot.reply_to(
+            message,
+            "🔑 *卡密兑换使用说明*\n\n"
+            "1. 获取充值卡密\n"
+            "2. 使用命令: `/redeem 卡密号码`\n"
+            "3. 系统会自动识别卡密类型并充值\n\n"
+            "示例: `/redeem ABCDEFG123456789`",
+            parse_mode='Markdown'
+        )
+        return
+    
+    card_id = text.split()[1]
+    success, result_msg = redeem_card(user_id, card_id)
+    
+    if success:
+        # 记录日志
+        c = conn.cursor()
+        c.execute("INSERT INTO card_usage_logs (card_id, user_id, amount) VALUES (?, ?, ?)",
+                  (card_id, user_id, result_msg.split()[1] if "积分" in result_msg else 0))
+        conn.commit()
+        
+        # 获取用户当前信息
+        credits = get_user_credits(user_id)
+        if is_vip_user(user_id):
+            c.execute("SELECT vip_expiry FROM users WHERE user_id = ?", (user_id,))
+            expiry_result = c.fetchone()
+            if expiry_result and expiry_result[0]:
+                expiry = expiry_result[0].split('.')[0]  # 正确处理时间格式
+                result_msg += f"\n💰 当前积分: {credits}\n🌟 VIP有效期至: {expiry}"
+        else:
+            result_msg += f"\n💰 当前积分: {credits}"
+    
+    bot.reply_to(message, result_msg)
+
+# ==================== 批量查询功能 ====================
+@bot.message_handler(commands=['batch'])
+def handle_batch_query(message):
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    
+    # 更新用户活跃时间
+    update_user_last_active(user_id)
+    
+    # 检查积分
+    success, cost = deduct_command_cost(user_id, '/batch')
+    if not success:
+        bot.reply_to(
+            message,
+            f"❌ 积分不足！需要 {cost} 积分，您当前有 {get_user_credits(user_id)} 积分\n"
+            "请签到或联系管理员充值"
+        )
+        return
+    
+    # 发送使用说明和模板
+    max_lines = VIP_PRIVILEGES["batch_limit"] if is_vip_user(user_id) else 1000
+    instructions = (
+        f"📤 *批量查询功能* ({'VIP特权' if is_vip_user(user_id) else '普通用户'})\n\n"
+        f"1. 准备CSV文件，每行一个查询任务 (最多{max_lines}行)\n"
+        "2. 文件格式: `命令,参数1,参数2,...`\n"
+        "3. 示例:\n"
+        "```\n"
+        "/my,123456,13800138000\n"
+        "/yd,张三,北京\n"
+        "/verify,李四,110101199001011234\n"
+        "```\n"
+        "4. 上传文件后系统会后台处理\n\n"
+        "⚠️ 注意: 每行消耗相应命令积分!\n\n"
+        "📎 下载[模板文件](https://example.com/batch_template.csv)"
+    )
+    
+    bot.reply_to(
+        message,
+        instructions,
+        parse_mode='Markdown'
+    )
+    
+    # 记录查询
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO query_logs (user_id, command, params, cost) VALUES (?, ?, ?, ?)",
+        (user_id, '/batch', 'init', cost)
+    )
+    conn.commit()
+
+# ==================== 批量查询处理 ====================
+def process_batch_query(task_id, file_content):
+    try:
+        c = conn.cursor()
+        c.execute("UPDATE batch_tasks SET status = 'processing' WHERE id = ?", (task_id,))
+        conn.commit()
+        
+        # 获取任务信息
+        c.execute("SELECT user_id FROM batch_tasks WHERE id = ?", (task_id,))
+        user_id = c.fetchone()[0]
+        
+        # 处理文件内容
+        content = file_content.decode('utf-8')
+        lines = content.splitlines()
+        
+        # 处理每行查询
+        results = ["原始行,结果,状态,消耗积分"]  # 添加表头
+        success_count = 0
+        error_count = 0
+        total_cost = 0
+        line_count = len(lines)
+        
+        # 使用线程池并行处理
+        max_workers = 15 if is_vip_user(user_id) else 10
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for idx, line in enumerate(lines[:1000]):  # 限制最大1000行
+                if not line.strip() or line.startswith('#'):
+                    continue
+                futures.append(executor.submit(process_query_line, user_id, line))
+                
+                # 每处理50行发送进度更新
+                if idx > 0 and idx % 50 == 0:
+                    bot.send_message(
+                        user_id, 
+                        f"⏳ 批量处理进度: 已处理 {idx}/{line_count} 行"
+                    )
+            
+            for future in concurrent.futures.as_completed(futures):
+                result, cost, success, error_msg = future.result()
+                if success:
+                    results.append(f"{result},{cost}")
+                    success_count += 1
+                    total_cost += cost
+                else:
+                    results.append(f"{result},错误: {error_msg},0")
+                    error_count += 1
+        
+        # 生成结果文件
+        result_content = "\n".join(results)
+        result_file = io.BytesIO(result_content.encode('utf-8'))
+        result_file.name = f"batch_result_{task_id}.csv"
+        
+        # 更新任务状态
+        c.execute(
+            "UPDATE batch_tasks SET status = 'completed', completed_at = CURRENT_TIMESTAMP, result_count = ? WHERE id = ?",
+            (success_count, task_id)
+        )
+        conn.commit()
+        
+        # 通知用户
+        bot.send_document(
+            user_id,
+            result_file,
+            caption=(
+                f"✅ 批量查询任务完成!\n"
+                f"任务ID: {task_id}\n"
+                f"成功: {success_count}条\n"
+                f"失败: {error_count}条\n"
+                f"总消耗: {total_cost}积分"
+            )
+        )
+        
+    except Exception as e:
+        c.execute("UPDATE batch_tasks SET status = 'failed' WHERE id = ?", (task_id,))
+        conn.commit()
+        bot.send_message(
+            user_id if 'user_id' in locals() else ADMIN_ID,
+            f"❌ 批量查询任务失败 (ID:{task_id}): {str(e)}"
+        )
+
+def process_query_line(user_id, line):
+    try:
+        parts = line.strip().split(',')
+        if len(parts) < 2:
+            return line, 0, False, "参数不足"
+        
+        command = parts[0].strip()
+        params = parts[1:]
+        
+        # 检查命令是否有效
+        c = conn.cursor()
+        c.execute("SELECT cost FROM command_costs WHERE command = ?", (command,))
+        cost_info = c.fetchone()
+        if not cost_info:
+            return line, 0, False, "无效命令"
+        cost = cost_info[0]
+        
+        # VIP用户折扣
+        if is_vip_user(user_id):
+            cost = int(cost * VIP_PRIVILEGES["query_discount"])
+        
+        # 检查积分
+        current_credits = get_user_credits(user_id)
+        if current_credits < cost:
+            return line, 0, False, "积分不足"
+        
+        # 执行查询 (模拟)
+        # 实际应用中这里应该调用相应的查询函数
+        if command == '/my' and len(params) == 2:
+            result = f"QQ绑定,{params[0]},{params[1]},成功"
+        elif command == '/verify' and len(params) == 2:
+            result = f"二要素核验,{params[0]},{params[1]},一致"
+        elif command == '/yd' and len(params) == 2:
+            result = f"人口查询,{params[0]},{params[1]},成功"
+        else:
+            return line, 0, False, "命令格式错误"
+        
+        # 扣除积分
+        update_credits(user_id, -cost)
+        
+        return result, cost, True, ""
+        
+    except Exception as e:
+        return line, 0, False, str(e)
+
+# ==================== 处理数据更新 ====================
+def process_uploaded_data(upload_id, file_content):
+    try:
+        c = conn.cursor()
+        c.execute("UPDATE data_uploads SET status = 'processing' WHERE id = ?", (upload_id,))
+        conn.commit()
+        
+        # 处理文件内容
+        content = file_content.decode('utf-8')
+        record_count = len(content.splitlines()) - 1  # 减标题行
+        
+        # 模拟处理时间
+        time.sleep(10)
+        
+        # 更新记录
+        c.execute(
+            "UPDATE data_uploads SET status = 'completed', record_count = ? WHERE id = ?",
+            (record_count, upload_id)
+        )
+        conn.commit()
+        
+        # 通知管理员
+        bot.send_message(
+            ADMIN_ID,
+            f"✅ 数据更新完成!\n"
+            f"ID: {upload_id}\n"
+            f"记录数: {record_count}\n"
+            f"处理时间: 10秒"
+        )
+        
+    except Exception as e:
+        c.execute("UPDATE data_uploads SET status = 'failed' WHERE id = ?", (upload_id,))
+        conn.commit()
+        bot.send_message(ADMIN_ID, f"❌ 数据处理失败 (ID:{upload_id}): {str(e)}")
+
+# ==================== 卡密管理命令 ====================
+@bot.message_handler(commands=['cardadmin'])
+def card_admin_menu(message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
+        types.InlineKeyboardButton("生成积分卡", callback_data="gen_credit_card"),
+        types.InlineKeyboardButton("生成VIP卡", callback_data="gen_vip_card")
+    )
+    markup.row(
+        types.InlineKeyboardButton("卡密统计", callback_data="card_stats"),
+        types.InlineKeyboardButton("导出卡密", callback_data="export_cards")
+    )
+    
+    bot.send_message(
+        message.chat.id,
+        "🔑 *卡密管理系统* - 管理员面板\n\n"
+        "请选择操作:",
+        parse_mode='Markdown',
+        reply_markup=markup
+    )
+
+# ==================== 卡密管理回调处理 ====================
+@bot.callback_query_handler(func=lambda call: call.data.startswith('gen_') or call.data in ['card_stats', 'export_cards'])
+def handle_card_admin_callback(call):
+    if str(call.from_user.id) != ADMIN_ID:
+        return
+    
+    if call.data == 'gen_credit_card':
+        msg = bot.send_message(
+            call.message.chat.id,
+            "🪙 生成积分卡密\n\n"
+            "请输入参数格式:\n"
+            "`积分数量 生成数量 [有效期天数=30] [备注]`\n\n"
+            "示例: `1000 10 60 活动赠送卡`",
+            parse_mode='Markdown'
+        )
+        bot.register_next_step_handler(msg, process_gen_credit_card)
+    
+    elif call.data == 'gen_vip_card':
+        msg = bot.send_message(
+            call.message.chat.id,
+            "🌟 生成VIP卡密\n\n"
+            "请输入参数格式:\n"
+            "`VIP天数 生成数量 [有效期天数=30] [备注]`\n\n"
+            "示例: `30 5 90 月度VIP卡`",
+            parse_mode='Markdown'
+        )
+        bot.register_next_step_handler(msg, process_gen_vip_card)
+    
+    elif call.data == 'card_stats':
+        show_card_stats(call.message)
+    
+    elif call.data == 'export_cards':
+        export_cards(call.message)
+
+def process_gen_credit_card(message):
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            raise ValueError("参数不足")
+        
+        amount = int(parts[0])
+        count = int(parts[1])
+        expires_in = int(parts[2]) if len(parts) > 2 else 30
+        note = ' '.join(parts[3:]) if len(parts) > 3 else ''
+        
+        if count > 100:
+            bot.reply_to(message, "❌ 单次最多生成100张卡密")
+            return
+        
+        generated_cards = []
+        for _ in range(count):
+            card_id = create_recharge_card(amount, 'credits', 0, note, message.from_user.id, expires_in)
+            generated_cards.append(card_id)
+        
+        # 保存卡密到文件
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        file_name = f"credit_cards_{timestamp}.txt"
+        file_content = "\n".join([f"{card_id} {amount}积分" for card_id in generated_cards])
+        
+        bot.send_document(
+            message.chat.id,
+            io.BytesIO(file_content.encode('utf-8')),
+            caption=(
+                f"✅ 成功生成 {count} 张积分卡密!\n"
+                f"每张卡值: {amount}积分\n"
+                f"有效期: {expires_in}天\n\n"
+                f"使用命令: `/redeem 卡号`"
+            ),
+            visible_file_name=file_name
+        )
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ 生成失败: {str(e)}")
+
+def process_gen_vip_card(message):
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            raise ValueError("参数不足")
+        
+        vip_days = int(parts[0])
+        count = int(parts[1])
+        expires_in = int(parts[2]) if len(parts) > 2 else 30
+        note = ' '.join(parts[3:]) if len(parts) > 3 else ''
+        
+        if count > 50:
+            bot.reply_to(message, "❌ 单次最多生成50张VIP卡密")
+            return
+        
+        generated_cards = []
+        for _ in range(count):
+            card_id = create_recharge_card(0, 'vip', vip_days, note, message.from_user.id, expires_in)
+            generated_cards.append(card_id)
+        
+        # 保存卡密到文件
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        file_name = f"vip_cards_{timestamp}.txt"
+        file_content = "\n".join([f"{card_id} {vip_days}天VIP" for card_id in generated_cards])
+        
+        bot.send_document(
+            message.chat.id,
+            io.BytesIO(file_content.encode('utf-8')),
+            caption=(
+                f"✅ 成功生成 {count} 张VIP卡密!\n"
+                f"每张卡值: {vip_days}天VIP特权\n"
+                f"有效期: {expires_in}天\n\n"
+                f"使用命令: `/redeem 卡号`"
+            ),
+            visible_file_name=file_name
+        )
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ 生成失败: {str(e)}")
+
+def show_card_stats(message):
+    c = conn.cursor()
+    
+    # 总体统计
+    c.execute("SELECT COUNT(*) FROM recharge_cards")
+    total_cards = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM recharge_cards WHERE is_used = 1")
+    used_cards = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM recharge_cards WHERE expires_at < CURRENT_TIMESTAMP")
+    expired_cards = c.fetchone()[0]
+    
+    # 积分卡统计
+    c.execute("SELECT COUNT(*), SUM(amount) FROM recharge_cards WHERE card_type = 'credits' AND is_used = 1")
+    credit_stats = c.fetchone()
+    credit_cards = credit_stats[0] or 0
+    total_credits = credit_stats[1] or 0
+    
+    # VIP卡统计
+    c.execute("SELECT COUNT(*), SUM(vip_days) FROM recharge_cards WHERE card_type = 'vip' AND is_used = 1")
+    vip_stats = c.fetchone()
+    vip_cards = vip_stats[0] or 0
+    total_vip_days = vip_stats[1] or 0
+    
+    stats_msg = (
+        f"📊 *卡密系统统计*\n\n"
+        f"🔑 总卡密数: {total_cards}\n"
+        f"✅ 已使用: {used_cards}\n"
+        f"⌛ 已过期: {expired_cards}\n"
+        f"🔄 未使用: {total_cards - used_cards - expired_cards}\n\n"
+        f"🪙 *积分卡统计*\n"
+        f"• 已使用: {credit_cards}张\n"
+        f"• 总充值积分: {total_credits}\n\n"
+        f"🌟 *VIP卡统计*\n"
+        f"• 已使用: {vip_cards}张\n"
+        f"• 总VIP天数: {total_vip_days}天"
+    )
+    
+    bot.send_message(message.chat.id, stats_msg, parse_mode='Markdown')
+
+def export_cards(message):
+    c = conn.cursor()
+    
+    # 获取所有未使用卡密
+    c.execute("SELECT card_id, amount, card_type, vip_days, expires_at, note FROM recharge_cards WHERE is_used = 0")
+    unused_cards = c.fetchall()
+    
+    if not unused_cards:
+        bot.reply_to(message, "❌ 没有可导出的未使用卡密")
+        return
+    
+    # 生成文件内容
+    file_content = "卡号,类型,值,有效期,备注\n"
+    for card in unused_cards:
+        card_id, amount, card_type, vip_days, expires_at, note = card
+        card_value = f"{amount}积分" if card_type == 'credits' else f"{vip_days}天VIP"
+        file_content += f"{card_id},{card_type},{card_value},{expires_at},{note}\n"
+    
+    # 发送文件
+    bot.send_document(
+        message.chat.id,
+        io.BytesIO(file_content.encode('utf-8')),
+        caption=f"✅ 成功导出 {len(unused_cards)} 张未使用卡密",
+        visible_file_name="unused_cards.csv"
+    )
+
+# ==================== 管理员命令 - 查看批量任务 ====================
+@bot.message_handler(commands=['batch_tasks'])
+def list_batch_tasks(message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return
+    
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, task_type, status, created_at, result_count FROM batch_tasks ORDER BY id DESC LIMIT 10")
+    tasks = c.fetchall()
+    
+    if not tasks:
+        bot.reply_to(message, "暂无批量任务")
+        return
+    
+    task_list = "📋 最近批量任务:\n\n"
+    for task in tasks:
+        task_id, user_id, task_type, status, created_at, result_count = task
+        task_list += (
+            f"ID: {task_id}\n"
+            f"用户: {user_id}\n"
+            f"类型: {task_type}\n"
+            f"状态: {status}\n"
+            f"时间: {created_at}\n"
+            f"结果数: {result_count or 0}\n"
+            "──────────────\n"
+        )
+    
+    bot.reply_to(message, task_list)
+
+# ==================== 管理员命令 ====================
+@bot.message_handler(commands=['stats'])
+def system_stats(message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return
+    
+    c = conn.cursor()
+    
+    # 用户统计
+    c.execute("SELECT COUNT(*) FROM users")
+    user_count = c.fetchone()[0]
+    
+    c.execute("SELECT SUM(credits) FROM users")
+    total_credits = c.fetchone()[0] or 0
+    
+    # VIP用户统计
+    c.execute("SELECT COUNT(*) FROM users WHERE vip_expiry > CURRENT_TIMESTAMP")
+    vip_count = c.fetchone()[0]
+    
+    # 查询统计
+    c.execute("SELECT COUNT(*) FROM query_logs WHERE date(timestamp) = date('now')")
+    daily_queries = c.fetchone()[0]
+    
+    # 卡密统计
+    c.execute("SELECT COUNT(*) FROM recharge_cards")
+    card_count = c.fetchone()[0]
+    
+    # 数据统计
+    c.execute("SELECT COUNT(*) FROM data_uploads")
+    upload_count = c.fetchone()[0]
+    
+    # 批量任务统计
+    c.execute("SELECT COUNT(*) FROM batch_tasks")
+    batch_count = c.fetchone()[0]
+    
+    # 文件统计
+    c.execute("SELECT COUNT(*) FROM files")
+    file_count = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM files WHERE is_volume = 1")
+    volume_file_count = c.fetchone()[0]
+    
+    stats_msg = (
+        f"📊 系统统计\n\n"
+        f"👥 用户总数: {user_count} (VIP: {vip_count})\n"
+        f"💰 系统总积分: {total_credits}\n"
+        f"🔑 卡密总数: {card_count}\n"
+        f"🔍 今日查询: {daily_queries}次\n"
+        f"📤 数据更新: {upload_count}次\n"
+        f"📋 批量任务: {batch_count}次\n"
+        f"📁 文件存储: {file_count} (分卷: {volume_file_count})\n\n"
+        f"💾 数据库大小: {os.path.getsize('soc_data.db')/1024/1024:.2f} MB"
+    )
+    
+    bot.reply_to(message, stats_msg)
+
+@bot.message_handler(commands=['update_data'])
+def update_data_command(message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return
+    
+    bot.reply_to(
+        message,
+        "📤 请上传数据文件 (CSV格式)\n\n"
+        "文件名格式: `地区_年月日.csv`\n"
+        "示例: `beijing_20250615.csv`\n\n"
+        "文件内容格式:\n"
+        "姓名,手机号,身份证号,数据来源\n\n"
+        "⚠️ 最大支持5MB文件",
+        parse_mode='Markdown'
+    )
+
+# ==================== 错误处理 ====================
+@bot.message_handler(func=lambda message: True)
+def handle_unknown(message):
+    text = message.text.strip()
+    
+    # 更新用户活跃时间
+    update_user_last_active(message.from_user.id)
+    
+    # 智能识别类似命令
+    if text.startswith('/'):
+        bot.reply_to(
+            message,
+            f"⚠️ 未知命令: {text.split()[0]}\n"
+            "使用 /help 查看可用命令"
+        )
+    else:
+        # 尝试猜测用户意图
+        if '积分' in text or '点数' in text:
+            show_credits(message)
+        elif '签到' in text:
+            check_in(message)
+        elif '核验' in text or '验证' in text:
+            bot.reply_to(
+                message,
+                "🆔 二要素核验命令:\n"
+                "`/verify 姓名 身份证号`\n"
+                "示例: `/verify 张三 110101199001011234`\n"
+                "消耗2积分/次",
+                parse_mode='Markdown'
+            )
+        elif '批量' in text or 'csv' in text:
+            bot.reply_to(
+                message,
+                "📋 批量查询使用说明:\n"
+                "1. 使用命令 `/batch` (消耗10积分)\n"
+                "2. 上传CSV文件，格式为:\n"
+                "命令,参数1,参数2,...\n"
+                "示例:\n"
+                "`/my,123456,13800138000`\n"
+                "`/verify,李四,110101199001011234`\n"
+                "3. 下载[模板文件](https://example.com/batch_template.csv)"
+            )
+        elif '卡密' in text or '充值' in text:
+            bot.reply_to(
+                message,
+                "🔑 卡密兑换命令:\n"
+                "`/redeem 卡号`\n\n"
+                "VIP卡密可兑换会员特权，积分卡密可增加账户积分"
+            )
+        elif '查询' in text or '查' in text:
+            bot.reply_to(
+                message,
+                "🔍 请使用具体查询命令:\n"
+                "• /my QQ绑手机 (1积分)\n"
+                "• /qe 综合查询 (3积分)\n"
+                "• /yd 人口查询 (3积分)\n"
+                "• /help 查看全部命令"
+            )
+        elif '个人中心' in text or '我的信息' in text:
+            user_profile(message)
+        elif '文件' in text or '搜索' in text:
+            bot.reply_to(
+                message,
+                "📁 文件检索命令:\n"
+                "`/search 关键词`\n"
+                "示例: `/search 上海客户数据`"
+            )
+        else:
+            bot.reply_to(
+                message,
+                "🤖 我是老皮社工库机器人\n"
+                "输入 /help 查看使用指南\n"
+                "输入 /kn 查看个人中心"
+            )
+
+# ==================== 主程序入口 ====================
+if __name__ == '__main__':
+    # 启动消息
+    print("机器人启动中...")
+    logging.info(f"机器人启动，管理员ID: {ADMIN_ID}")
+    
+    try:
+        bot.infinity_polling()
+    except Exception as e:
+        logging.error(f"机器人异常停止: {str(e)}")
+        # 发送警报给管理员
+        bot.send_message(ADMIN_ID, f"⚠️ 机器人异常停止: {str(e)}")

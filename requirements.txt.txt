@@ -1,0 +1,8 @@
+pyTelegramBotAPI
+python-dotenv
+sqlite3
+pandas
+libtorrent
+py7zr
+python-magic
+psutil
